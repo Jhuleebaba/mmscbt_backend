@@ -19,6 +19,9 @@ import os
 # Create the Flask application instance
 app = create_app(os.environ.get('FLASK_ENV', 'development'))
 
+# Start keep-alive thread
+start_keep_alive()
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     is_development = os.environ.get('FLASK_ENV', 'development') == 'development'
@@ -30,7 +33,6 @@ if __name__ == '__main__':
     print(f" MongoDB: {os.environ.get('MONGO_DBNAME', 'cbt_exam_database')}")
     print(f" CORS Origins: {app.config.get('CORS_ORIGINS')}")
     
-    # Start keep-alive thread
-    start_keep_alive()
+
     
     app.run(debug=is_development, host='0.0.0.0', port=port)
