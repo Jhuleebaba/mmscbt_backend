@@ -13,6 +13,7 @@ logging.basicConfig(
 logging.getLogger('werkzeug').setLevel(logging.INFO)
 
 from app import create_app
+from app.utils.keep_alive import start_keep_alive
 import os
 
 # Create the Flask application instance
@@ -28,5 +29,8 @@ if __name__ == '__main__':
     print(f" Environment: {'Development' if is_development else 'Production'}")
     print(f" MongoDB: {os.environ.get('MONGO_DBNAME', 'cbt_exam_database')}")
     print(f" CORS Origins: {app.config.get('CORS_ORIGINS')}")
+    
+    # Start keep-alive thread
+    start_keep_alive()
     
     app.run(debug=is_development, host='0.0.0.0', port=port)

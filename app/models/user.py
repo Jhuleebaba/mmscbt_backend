@@ -24,9 +24,12 @@ class User:
     @staticmethod
     def find_by_id(user_id):
         """Find user by ID"""
-        if isinstance(user_id, str):
-            user_id = ObjectId(user_id)
-        return mongo.db.users.find_one({'_id': user_id, 'is_active': True})
+        try:
+            if isinstance(user_id, str):
+                user_id = ObjectId(user_id)
+            return mongo.db.users.find_one({'_id': user_id, 'is_active': True})
+        except:
+            return None
     
     @staticmethod
     def find_by_username(username):

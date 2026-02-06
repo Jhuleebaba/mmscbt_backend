@@ -20,9 +20,12 @@ class Class:
     @staticmethod
     def find_by_id(class_id):
         """Find class by ID"""
-        if isinstance(class_id, str):
-            class_id = ObjectId(class_id)
-        return mongo.db.classes.find_one({'_id': class_id, 'is_active': True})
+        try:
+            if isinstance(class_id, str):
+                class_id = ObjectId(class_id)
+            return mongo.db.classes.find_one({'_id': class_id, 'is_active': True})
+        except:
+            return None
     
     @staticmethod
     def find_by_name(class_name):
@@ -111,9 +114,12 @@ class Subject:
     @staticmethod
     def find_by_id(subject_id):
         """Find subject by ID"""
-        if isinstance(subject_id, str):
-            subject_id = ObjectId(subject_id)
-        return mongo.db.subjects.find_one({'_id': subject_id, 'is_active': True})
+        try:
+            if isinstance(subject_id, str):
+                subject_id = ObjectId(subject_id)
+            return mongo.db.subjects.find_one({'_id': subject_id, 'is_active': True})
+        except:
+            return None
     
     @staticmethod
     def find_by_name(subject_name):

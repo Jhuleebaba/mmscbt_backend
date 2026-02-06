@@ -365,7 +365,7 @@ def create_question(exam_id):
     question_data = {
         'exam_id': ObjectId(exam_id),
         'question_number': existing_count + 1,
-        'question_text': data['question_text'],
+        'question_text': data.get('question_text', ''),
         'question_type': data['question_type'],
         'marks': data.get('marks', 1),
         'image_url': data.get('image_url'),
@@ -472,7 +472,7 @@ def bulk_create_questions(exam_id):
         question_data = {
             'exam_id': ObjectId(exam_id),
             'question_number': existing_count + created_count + 1,
-            'question_text': q_data['question_text'],
+            'question_text': q_data.get('question_text', ''),
             'question_type': q_data['question_type'],
             'marks': q_data.get('marks', 1),
             'image_url': q_data.get('image_url'),

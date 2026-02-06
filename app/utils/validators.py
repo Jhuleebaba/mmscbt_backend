@@ -54,11 +54,17 @@ def validate_question_data(question_data):
     Validate question data for exam questions.
     Returns tuple (is_valid, error_message)
     """
-    required_fields = ['question_text', 'question_type', 'marks']
+    required_fields = ['question_type', 'marks']
     is_valid, missing = validate_required_fields(question_data, required_fields)
     
     if not is_valid:
         return False, f"Missing required fields: {', '.join(missing)}"
+    
+    question_type = question_data.get('question_type')
+
+    # specific validation for question text
+    if question_type != 'theory' and not question_data.get('question_text'):
+        return False, "Question text is required for this question type"
     
     question_type = question_data.get('question_type')
     
