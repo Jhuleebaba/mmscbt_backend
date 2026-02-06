@@ -32,7 +32,7 @@ class Config:
     FRONTEND_URL = os.environ.get('FRONTEND_URL') or 'http://localhost:3001'
     
     # CORS Configuration
-    CORS_ORIGINS = [origin.strip() for origin in os.environ.get(
+    CORS_ORIGINS = [origin.strip().rstrip('/') for origin in os.environ.get(
         'CORS_ORIGINS',
         'http://localhost:3001'
     ).split(',') if origin.strip()]
