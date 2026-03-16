@@ -10,6 +10,71 @@ from app.utils.decorators import admin_required, exam_mode_required, get_current
 from app.utils.validators import validate_required_fields, validate_question_data
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
 
+# ==================== TIME ENFORCEMENT HELPERS ====================
+
+def _resolve_duration_seconds(exam, session):
+    if session and session.get('duration_seconds'):
+        try:
+            return int(session.get('duration_seconds'))
+        except Exception:
+            return None
+    if exam and exam.get('duration_minutes'):
+        try:
+            return int(exam.get('duration_minutes', 60) * 60)
+        except Exception:
+            return None
+    return None
+
+
+def _get_time_remaining_seconds(session, duration_seconds):
+    if not duration_seconds or not session or not session.get('start_time'):
+        return None
+    elapsed = (datetime.utcnow() - session['start_time']).total_seconds()
+    remaining = int(max(0, duration_seconds - elapsed))
+    return remaining
+
+
+def _is_session_expired(session, duration_seconds):
+    if not duration_seconds or not session or not session.get('start_time'):
+        return False
+    elapsed = (datetime.utcnow() - session['start_time']).total_seconds()
+    return elapsed >= duration_seconds
+
+
+def _finalize_mcq_session(session, exam, user_id, claims, completion_reason='time_elapsed'):
+    """Finalize MCQ session if not already finalized. Idempotent."""
+    if not session or session.get('status') != 'in_progress':
+        return
+
+    max_mcq_marks = exam.get('max_mcq_marks', 30) if exam else 30
+    mcq_score = ExamResult.calculate_mcq_score(session, max_mcq_marks)
+
+    ExamSession.complete_session(session['_id'], {
+        'mcq_score': mcq_score,
+        'status': 'expired',
+        'end_time': datetime.utcnow()
+    })
+
+    existing_result = mongo.db.exam_results.find_one({
+        'student_id': ObjectId(user_id),
+        'exam_id': session['exam_id'],
+        'session_id': ObjectId(session['_id'])
+    })
+
+    if not existing_result:
+        result_data = {
+            'student_id': ObjectId(user_id),
+            'exam_id': session['exam_id'],
+            'session_id': ObjectId(session['_id']),
+            'admission_number': claims.get('admission_number'),
+            'full_name': claims.get('full_name'),
+            'class_id': claims.get('class_id'),
+            'mcq_score': mcq_score,
+            'status': 'mcq_completed',
+            'completion_reason': completion_reason
+        }
+        ExamResult.create_result(result_data)
+
 # ==================== ADMIN EXAM MANAGEMENT ====================
 
 @bp.route('/exams', methods=['GET'])
@@ -205,7 +270,7 @@ def update_exam(exam_id):
     allowed_fields = [
         'title', 'subject', 'description', 'duration_minutes', 'max_mcq_marks',
         'eligible_classes', 'instructions', 'shuffle_questions', 'shuffle_options',
-        'show_correct_answers', 'academic_term', 'academic_session'
+        'show_correct_answers', 'academic_term', 'academic_session', 'mcq_count'
     ]
     
     for field in allowed_fields:
@@ -656,10 +721,18 @@ def start_exam(exam_id):
     exam = Exam.find_by_id(exam_id)
     if not exam:
         return jsonify({'error': 'Exam not found'}), 404
+
+    duration_seconds = _resolve_duration_seconds(exam, None)
     
     # Check if student already has an active session
     existing_session = ExamSession.find_active_session(user_id, exam_id)
     if existing_session:
+        # Enforce time
+        duration_seconds = _resolve_duration_seconds(exam, existing_session)
+        if _is_session_expired(existing_session, duration_seconds):
+            _finalize_mcq_session(existing_session, exam, user_id, claims, completion_reason='time_elapsed')
+            return jsonify({'error': 'Exam time has elapsed'}), 400
+
         # Resume existing session - use stored question IDs if randomized
         selected_question_ids = existing_session.get('selected_question_ids')
         
@@ -684,7 +757,8 @@ def start_exam(exam_id):
             },
             'questions': serialize_questions_for_student(questions),
             'answers': existing_session.get('answers', {}),
-            'start_time': existing_session['start_time'].isoformat()
+            'start_time': existing_session['start_time'].isoformat(),
+            'time_remaining': _get_time_remaining_seconds(existing_session, duration_seconds)
         }), 200
     
     # Check if student already completed this exam
@@ -732,7 +806,8 @@ def start_exam(exam_id):
         'admission_number': claims.get('admission_number'),
         'full_name': claims.get('full_name'),
         'class_id': claims.get('class_id'),
-        'selected_question_ids': selected_question_ids  # Store for resume consistency
+        'selected_question_ids': selected_question_ids,  # Store for resume consistency
+        'duration_seconds': duration_seconds
     }
     
     session = ExamSession.create_session(session_data)
@@ -747,7 +822,8 @@ def start_exam(exam_id):
             'instructions': exam.get('instructions', '')
         },
         'questions': serialize_questions_for_student(questions),
-        'start_time': session['start_time'].isoformat()
+        'start_time': session['start_time'].isoformat(),
+        'time_remaining': _get_time_remaining_seconds(session, duration_seconds)
     }), 201
 
 
@@ -756,6 +832,7 @@ def start_exam(exam_id):
 def submit_answer():
     """Submit an answer for a question"""
     claims = get_jwt()
+    user_id = get_jwt_identity()
     
     if claims.get('user_type') != 'student_exam':
         return jsonify({'error': 'Exam mode access required'}), 403
@@ -776,15 +853,41 @@ def submit_answer():
     session = ExamSession.find_by_id(session_id)
     if not session:
         return jsonify({'error': 'Session not found'}), 404
+
+    if str(session.get('student_id')) != str(user_id):
+        return jsonify({'error': 'Unauthorized session access'}), 403
     
     if session.get('status') != 'in_progress':
         return jsonify({'error': 'Session is not active'}), 400
+
+    # Enforce time
+    exam = Exam.find_by_id(session['exam_id'])
+    duration_seconds = _resolve_duration_seconds(exam, session)
+    if _is_session_expired(session, duration_seconds):
+        _finalize_mcq_session(session, exam, user_id, claims, completion_reason='time_elapsed')
+        return jsonify({'error': 'Exam time has elapsed'}), 400
+
+    # Ensure question belongs to exam / selected pool
+    selected_ids = session.get('selected_question_ids')
+    if selected_ids:
+        if str(question_id) not in {str(x) for x in selected_ids}:
+            return jsonify({'error': 'Question not part of this session'}), 400
+    else:
+        question = Question.find_by_id(question_id)
+        if not question or question.get('exam_id') != session.get('exam_id'):
+            return jsonify({'error': 'Invalid question for this exam'}), 400
     
     # Submit the answer
     success, is_correct = ExamSession.submit_mcq_answer(session_id, question_id, selected_option)
     
     if not success:
         return jsonify({'error': 'Failed to submit answer'}), 500
+
+    # Update activity timestamp
+    mongo.db.exam_sessions.update_one(
+        {'_id': ObjectId(session_id)},
+        {'$set': {'last_activity_at': datetime.utcnow()}}
+    )
     
     return jsonify({
         'message': 'Answer submitted successfully',
@@ -813,6 +916,9 @@ def complete_exam():
     session = ExamSession.find_by_id(session_id)
     if not session:
         return jsonify({'error': 'Session not found'}), 404
+
+    if str(session.get('student_id')) != str(user_id):
+        return jsonify({'error': 'Unauthorized session access'}), 403
     
     if session.get('status') != 'in_progress':
         return jsonify({'error': 'Session is not active'}), 400
@@ -820,6 +926,11 @@ def complete_exam():
     # Get exam for max marks
     exam = Exam.find_by_id(session['exam_id'])
     max_mcq_marks = exam.get('max_mcq_marks', 30) if exam else 30
+
+    duration_seconds = _resolve_duration_seconds(exam, session)
+    if _is_session_expired(session, duration_seconds):
+        _finalize_mcq_session(session, exam, user_id, claims, completion_reason='time_elapsed')
+        return jsonify({'error': 'Exam time has elapsed'}), 400
     
     # Calculate MCQ score
     mcq_score = ExamResult.calculate_mcq_score(session, max_mcq_marks)
@@ -859,6 +970,7 @@ def complete_exam():
 def get_session_status(session_id):
     """Get current session status and answers"""
     claims = get_jwt()
+    user_id = get_jwt_identity()
     
     if claims.get('user_type') != 'student_exam':
         return jsonify({'error': 'Exam mode access required'}), 403
@@ -867,6 +979,17 @@ def get_session_status(session_id):
     
     if not session:
         return jsonify({'error': 'Session not found'}), 404
+
+    if str(session.get('student_id')) != str(user_id):
+        return jsonify({'error': 'Unauthorized session access'}), 403
+
+    exam = Exam.find_by_id(session['exam_id'])
+    duration_seconds = _resolve_duration_seconds(exam, session)
+    time_remaining = _get_time_remaining_seconds(session, duration_seconds)
+    is_expired = _is_session_expired(session, duration_seconds)
+
+    if is_expired and session.get('status') == 'in_progress':
+        _finalize_mcq_session(session, exam, user_id, claims, completion_reason='time_elapsed')
     
     return jsonify({
         'message': 'Session status retrieved',
@@ -875,7 +998,9 @@ def get_session_status(session_id):
             'status': session.get('status'),
             'start_time': session['start_time'].isoformat() if session.get('start_time') else None,
             'answers': session.get('answers', {}),
-            'answered_count': len(session.get('answers', {}))
+            'answered_count': len(session.get('answers', {})),
+            'time_remaining': time_remaining,
+            'is_expired': is_expired
         }
     }), 200
 
@@ -922,6 +1047,8 @@ def start_theory_exam(exam_id):
     exam = Exam.find_by_id(exam_id)
     if not exam:
         return jsonify({'error': 'Exam not found'}), 404
+
+    duration_seconds = _resolve_duration_seconds(exam, None)
     
     # Check for existing theory session
     existing_session = mongo.db.theory_sessions.find_one({
@@ -938,10 +1065,17 @@ def start_theory_exam(exam_id):
     }).sort('question_number', 1))
     
     if existing_session:
+        # Enforce time
+        if _is_session_expired(existing_session, duration_seconds):
+            mongo.db.theory_sessions.update_one(
+                {'_id': existing_session['_id']},
+                {'$set': {'status': 'expired', 'end_time': datetime.utcnow()}}
+            )
+            return jsonify({'error': 'Exam time has elapsed'}), 400
+
         # Calculate time remaining
         elapsed = (datetime.utcnow() - existing_session['start_time']).total_seconds()
-        duration_seconds = exam.get('duration_minutes', 60) * 60
-        time_remaining = max(0, duration_seconds - elapsed)
+        time_remaining = max(0, (duration_seconds or 0) - elapsed)
         
         return jsonify({
             'message': 'Resuming theory session',
@@ -962,7 +1096,9 @@ def start_theory_exam(exam_id):
         'class_id': claims.get('class_id'),
         'start_time': datetime.utcnow(),
         'status': 'active',
-        'answers': {'main': {}, 'sub': {}}
+        'answers': {'main': {}, 'sub': {}},
+        'duration_seconds': duration_seconds,
+        'last_activity_at': datetime.utcnow()
     }
     
     result = mongo.db.theory_sessions.insert_one(session_data)
@@ -976,6 +1112,69 @@ def start_theory_exam(exam_id):
         'questions': serialize_questions_for_student(theory_questions),
         'time_remaining': exam.get('duration_minutes', 60) * 60
     }), 201
+
+
+@bp.route('/student/save-theory-progress', methods=['POST'])
+@jwt_required()
+def save_theory_progress():
+    """Save theory answers incrementally so a student can resume."""
+    claims = get_jwt()
+    user_id = get_jwt_identity()
+
+    if claims.get('user_type') != 'student_exam':
+        return jsonify({'error': 'Exam mode access required'}), 403
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    session_id = data.get('session_id')
+    if not session_id:
+        return jsonify({'error': 'Session ID required'}), 400
+
+    main_answers = data.get('main_answers', {})
+    sub_answers = data.get('sub_answers', {})
+
+    session = mongo.db.theory_sessions.find_one({
+        '_id': ObjectId(session_id),
+        'student_id': ObjectId(user_id),
+        'status': 'active'
+    })
+
+    if not session:
+        return jsonify({'error': 'Session not found or already completed'}), 404
+
+    exam = Exam.find_by_id(session['exam_id'])
+    duration_seconds = _resolve_duration_seconds(exam, session)
+    if _is_session_expired(session, duration_seconds):
+        mongo.db.theory_sessions.update_one(
+            {'_id': ObjectId(session_id)},
+            {'$set': {'status': 'expired', 'end_time': datetime.utcnow()}}
+        )
+        return jsonify({'error': 'Exam time has elapsed'}), 400
+
+    # Merge answers incrementally
+    current_answers = session.get('answers', {'main': {}, 'sub': {}})
+    merged_main = current_answers.get('main', {})
+    merged_main.update(main_answers or {})
+
+    merged_sub = current_answers.get('sub', {})
+    for qid, subs in (sub_answers or {}).items():
+        if qid not in merged_sub or not isinstance(merged_sub[qid], dict):
+            merged_sub[qid] = {}
+        merged_sub[qid].update(subs or {})
+
+    mongo.db.theory_sessions.update_one(
+        {'_id': ObjectId(session_id)},
+        {
+            '$set': {
+                'answers': {'main': merged_main, 'sub': merged_sub},
+                'last_activity_at': datetime.utcnow()
+            }
+        }
+    )
+
+    return jsonify({'message': 'Progress saved'}), 200
 
 
 @bp.route('/student/complete-theory-exam', methods=['POST'])
@@ -1009,6 +1208,15 @@ def complete_theory_exam():
     
     if not session:
         return jsonify({'error': 'Session not found or already completed'}), 404
+
+    exam = Exam.find_by_id(session['exam_id'])
+    duration_seconds = _resolve_duration_seconds(exam, session)
+    if _is_session_expired(session, duration_seconds):
+        mongo.db.theory_sessions.update_one(
+            {'_id': ObjectId(session_id)},
+            {'$set': {'status': 'expired', 'end_time': datetime.utcnow()}}
+        )
+        return jsonify({'error': 'Exam time has elapsed'}), 400
     
     # Update session with answers and mark as completed
     mongo.db.theory_sessions.update_one(
